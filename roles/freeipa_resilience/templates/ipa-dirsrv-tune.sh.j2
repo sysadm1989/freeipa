@@ -1,0 +1,215 @@
+#!/bin/bash
+# Приводит локальный 389-DS FreeIPA к параметрам устойчивости.
+# Динамические атрибуты действуют сразу. Лимит дескрипторов и backlog
+# записываются в cn=config и начнут работать при следующем старте dirsrv.
+# Запуск: ipa-dirsrv-tune [--dry-run]
+set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+IDLETIMEOUT="{{ freeipa_resilience_idletimeout }}"
+IOBLOCKTIMEOUT="{{ freeipa_resilience_ioblocktimeout }}"
+MAXDESCRIPTORS="{{ freeipa_resilience_maxdescriptors }}"
+LISTEN_BACKLOG="{{ freeipa_resilience_listen_backlog }}"
+CHANGELOG_MAX_AGE="{{ freeipa_resilience_changelog_max_age }}"
+ACCESS_LOG_MAX_DISK_MB="{{ freeipa_resilience_access_log_max_disk_mb }}"
+ERROR_LOG_MAX_DISK_MB="{{ freeipa_resilience_error_log_max_disk_mb }}"
+AUDIT_LOG_MAX_DISK_MB="{{ freeipa_resilience_audit_log_max_disk_mb }}"
+
+DRY=0
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY=1
+fi
+
+exec 9>/run/ipa-dirsrv-tune.lock
+if ! flock -n 9; then
+  echo "Другой ipa-dirsrv-tune уже выполняется" >&2
+  exit 1
+fi
+
+changed=0
+restart_required=0
+skipped=0
+seen=0
+failed=0
+
+ldap_get() {
+  local dn="$1" attr="$2" out err rc
+  out="$(mktemp)"
+  err="$(mktemp)"
+  set +e
+  ldapsearch -LLL -o ldif-wrap=no -Y EXTERNAL -H "$LDAPI" -b "$dn" -s base "$attr" >"$out" 2>"$err"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 32 ]]; then
+    rm -f "$out" "$err"
+    echo "__NO_SUCH_OBJECT__"
+    return 0
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    cat "$err" >&2
+    rm -f "$out" "$err"
+    return "$rc"
+  fi
+  awk -v key="${attr}:" 'BEGIN { IGNORECASE=1 }
+    {
+      line=$0
+      sub(/^[ \t]+/, "", line)
+      if (tolower(substr(line, 1, length(key))) == tolower(key)) {
+        sub(/^[^:]+:[ \t]*/, "", line)
+        print line
+        exit
+      }
+    }' "$out"
+  rm -f "$out" "$err"
+}
+
+apply_ldif() {
+  local file="$1"
+  if [[ ! -s "$file" ]]; then
+    rm -f "$file"
+    return 0
+  fi
+  echo "LDIF BEGIN"
+  cat "$file"
+  echo "LDIF END"
+  if [[ "$DRY" -eq 1 ]]; then
+    changed=1
+    rm -f "$file"
+    return 0
+  fi
+  if ldapmodify -Y EXTERNAL -H "$LDAPI" -f "$file"; then
+    changed=1
+    rm -f "$file"
+    return 0
+  fi
+  echo "WARNING: ldapmodify не применил ${file}, остальные параметры всё равно проверяются" >&2
+  rm -f "$file"
+  failed=1
+  return 1
+}
+
+tune_instance() {
+  local inst="$1" sock="" candidate
+  for candidate in "/run/slapd-${inst}.socket" "/var/run/slapd-${inst}.socket"; do
+    if [[ -S "$candidate" ]]; then
+      sock="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$sock" ]]; then
+    echo "WARNING: инстанс ${inst}: сокет dirsrv не найден, каталог не запущен, настройка пропущена"
+    skipped=1
+    return 0
+  fi
+
+  LDAPI="ldapi://${sock//\//%2F}"
+  echo "INSTANCE=${inst} LDAPI=${LDAPI}"
+
+  local current ldif
+
+  consider_config() {
+    local attr="$1" value="$2" needs_restart="${3:-0}"
+    if [[ -z "$value" ]]; then
+      return 0
+    fi
+    current="$(ldap_get "cn=config" "$attr")"
+    if [[ "$current" == "__NO_SUCH_OBJECT__" ]]; then
+      echo "cn=config недоступен на ${inst}" >&2
+      failed=1
+      return 0
+    fi
+    if [[ "$current" == "$value" ]]; then
+      echo "KEEP ${attr}=${value}"
+      return 0
+    fi
+    echo "SET ${attr}: '${current:-<empty>}' -> '${value}'"
+    ldif="$(mktemp)"
+    printf 'dn: cn=config\nchangetype: modify\nreplace: %s\n%s: %s\n' \
+      "$attr" "$attr" "$value" >"$ldif"
+    if apply_ldif "$ldif"; then
+      if [[ "$needs_restart" -eq 1 ]]; then
+        restart_required=1
+      fi
+    fi
+  }
+
+  consider_log_cap() {
+    local attr="$1" value="$2"
+    if [[ -z "$value" || "$value" == "0" ]]; then
+      return 0
+    fi
+    current="$(ldap_get "cn=config" "$attr")"
+    if [[ -z "$current" || "$current" == "0" ]]; then
+      consider_config "$attr" "$value" 0
+    else
+      echo "KEEP ${attr}=${current} (предел уже задан, не меняю)"
+    fi
+  }
+
+  consider_config nsslapd-idletimeout "$IDLETIMEOUT" 0
+  consider_config nsslapd-ioblocktimeout "$IOBLOCKTIMEOUT" 0
+  consider_config nsslapd-maxdescriptors "$MAXDESCRIPTORS" 1
+  consider_config nsslapd-listen-backlog-size "$LISTEN_BACKLOG" 1
+  consider_log_cap nsslapd-accesslog-logmaxdiskspace "$ACCESS_LOG_MAX_DISK_MB"
+  consider_log_cap nsslapd-errorlog-logmaxdiskspace "$ERROR_LOG_MAX_DISK_MB"
+  consider_log_cap nsslapd-auditlog-logmaxdiskspace "$AUDIT_LOG_MAX_DISK_MB"
+
+  if [[ -n "$CHANGELOG_MAX_AGE" ]]; then
+    local backends backend dn clog_ldif
+    backends="$(ldapsearch -LLL -o ldif-wrap=no -Y EXTERNAL -H "$LDAPI" \
+      -b "cn=ldbm database,cn=plugins,cn=config" "(objectClass=nsBackendInstance)" cn \
+      | awk 'tolower($1)=="cn:" { print $2 }')"
+    while IFS= read -r backend; do
+      [[ -z "$backend" ]] && continue
+      dn="cn=changelog,cn=${backend},cn=ldbm database,cn=plugins,cn=config"
+      current="$(ldap_get "$dn" "nsslapd-changelogmaxage")"
+      if [[ "$current" == "__NO_SUCH_OBJECT__" ]]; then
+        echo "SKIP changelog ${backend}: репликация не настроена"
+        continue
+      fi
+      if [[ "$current" == "$CHANGELOG_MAX_AGE" ]]; then
+        echo "KEEP changelog ${backend} nsslapd-changelogmaxage=${current}"
+        continue
+      fi
+      echo "SET changelog ${backend}: '${current:-<empty>}' -> '${CHANGELOG_MAX_AGE}'"
+      clog_ldif="$(mktemp)"
+      printf 'dn: %s\nchangetype: modify\nreplace: nsslapd-changelogmaxage\nnsslapd-changelogmaxage: %s\n' \
+        "$dn" "$CHANGELOG_MAX_AGE" >"$clog_ldif"
+      apply_ldif "$clog_ldif" || true
+    done <<<"$backends"
+  fi
+}
+
+shopt -s nullglob
+for dir in /etc/dirsrv/slapd-*; do
+  [[ -d "$dir" ]] || continue
+  inst="$(basename "$dir")"
+  inst="${inst#slapd-}"
+  seen=1
+  tune_instance "$inst"
+done
+
+if [[ "$seen" -eq 0 ]]; then
+  echo "Каталог /etc/dirsrv/slapd-* не найден" >&2
+  exit 1
+fi
+
+if [[ "$failed" -eq 1 ]]; then
+  echo "STATUS=failed"
+  exit 1
+fi
+
+if [[ "$restart_required" -eq 1 ]]; then
+  echo "NOTE: nsslapd-maxdescriptors и nsslapd-listen-backlog-size применятся при следующем старте dirsrv. Автоперезапуск не выполняется."
+  echo "RESTART_REQUIRED=yes"
+else
+  echo "RESTART_REQUIRED=no"
+fi
+
+if [[ "$changed" -eq 1 ]]; then
+  echo "STATUS=changed"
+elif [[ "$skipped" -eq 1 ]]; then
+  echo "STATUS=skipped"
+else
+  echo "STATUS=ok"
+fi

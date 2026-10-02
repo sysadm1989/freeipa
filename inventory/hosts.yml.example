@@ -1,0 +1,23 @@
+---
+# Скопируйте в inventory/hosts.yml и замените имена и адреса на свои.
+# Домен .example.test специально нерезолвящийся: playbook откажется работать,
+# пока здесь останутся эти имена.
+# ipa_primary — ровно один хост. ipa_replicas можно оставить пустой: hosts: {}
+all:
+  children:
+    ipa_servers:
+      children:
+        ipa_primary:
+          hosts:
+            ipa1.example.test:
+              freeipa_ip_address: 192.0.2.11
+        ipa_replicas:
+          hosts:
+            ipa2.example.test:
+              freeipa_ip_address: 192.0.2.12
+            ipa3.example.test:
+              freeipa_ip_address: 192.0.2.13
+    # Группу можно оставить пустой: hosts: {}
+    ipa_clients:
+      hosts:
+        client1.example.test:

@@ -1,0 +1,256 @@
+---
+- name: Файл с паролями есть на управляющей машине
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/inventory/secrets.yml"
+  delegate_to: localhost
+  become: false
+  register: freeipa_secrets_file
+
+- name: Пароли лежат в inventory/secrets.yml
+  ansible.builtin.assert:
+    that:
+      - freeipa_secrets_file.stat.exists
+    fail_msg: >-
+      Скопируйте inventory/secrets.yml.example в inventory/secrets.yml,
+      задайте пароли и выполните ansible-vault encrypt inventory/secrets.yml.
+
+- name: secrets.yml зашифрован
+  ansible.builtin.slurp:
+    src: "{{ playbook_dir }}/inventory/secrets.yml"
+  delegate_to: localhost
+  become: false
+  register: freeipa_secrets_raw
+
+- name: Отказать читать пароли открытым текстом
+  ansible.builtin.assert:
+    that:
+      - (freeipa_secrets_raw.content | b64decode).startswith('$ANSIBLE_VAULT')
+    fail_msg: >-
+      inventory/secrets.yml не зашифрован.
+      ansible-vault encrypt inventory/secrets.yml
+      и запуск с --ask-vault-pass.
+
+- name: Загрузить пароли
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/inventory/secrets.yml"
+  no_log: true
+
+- name: Домен и хост годятся для установки
+  ansible.builtin.assert:
+    that:
+      - freeipa_domain | length > 0
+      - "'.' in freeipa_domain"
+      - freeipa_resilience_allow_example_inventory | bool or freeipa_domain != 'example.test'
+      - freeipa_resilience_allow_example_inventory | bool or not inventory_hostname.endswith('.example.test')
+      - groups['ipa_primary'] | default([]) | length == 1
+      - ansible_os_family == 'RedHat'
+      - ansible_service_mgr == 'systemd'
+      - ansible_selinux.status | default('missing') != 'disabled'
+      - ansible_memtotal_mb | int >= (freeipa_install_min_mem_mb | int)
+      - inventory_hostname.endswith('.' ~ freeipa_domain)
+    fail_msg: >-
+      Проверьте freeipa_domain (не example.test), FQDN реплик в этом домене,
+      ровно один хост в ipa_primary, SELinux не disabled и минимум
+      {{ freeipa_install_min_mem_mb }} МиБ RAM.
+
+- name: Пароли из secrets.yml пригодны
+  ansible.builtin.set_fact:
+    freeipa_passwords_ok: >-
+      {{
+        (freeipa_ds_password | default('') | length >= 8)
+        and (freeipa_admin_password | default('') | length >= 8)
+        and (freeipa_ds_password != freeipa_admin_password)
+        and (freeipa_ds_password not in ['change-me-dm', 'password', 'CHANGEME'])
+        and (freeipa_admin_password not in ['change-me-admin', 'password', 'CHANGEME'])
+      }}
+  no_log: true
+
+- name: Пароли не короткие, не одинаковые и не заглушки
+  ansible.builtin.assert:
+    that:
+      - freeipa_passwords_ok | bool
+    fail_msg: >-
+      В secrets.yml нужны два разных пароля от 8 символов.
+      Заглушки change-me-dm и change-me-admin не подходят.
+
+- name: Для DNS выбран явный режим пересылки
+  ansible.builtin.assert:
+    that:
+      - freeipa_setup_dns | bool
+      - (freeipa_dns_forwarders | length > 0) or (freeipa_dns_no_forwarders | bool)
+      - not ((freeipa_dns_forwarders | length > 0) and (freeipa_dns_no_forwarders | bool))
+    fail_msg: >-
+      install.yml ставит FreeIPA с DNS. Задайте freeipa_dns_forwarders
+      или явно freeipa_dns_no_forwarders: true, но не оба сразу.
+
+- name: У каждой реплики указан её IP
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].freeipa_ip_address is defined
+      - hostvars[item].freeipa_ip_address is match('^[0-9a-fA-F:.]+$')
+    fail_msg: "Задайте freeipa_ip_address для {{ item }} в inventory."
+  loop: "{{ groups['ipa_servers'] }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Запомнить realm
+  ansible.builtin.set_fact:
+    freeipa_realm: "{{ freeipa_domain | upper }}"
+  when: freeipa_realm | length == 0
+
+- name: Пакеты сервера FreeIPA
+  ansible.builtin.package:
+    name:
+      - ipa-server
+      - ipa-server-dns
+      - firewalld
+      - chrony
+    state: present
+
+- name: Включить firewalld до установщика, чтобы он открыл порты IPA
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+- name: Включить chronyd до установщика
+  ansible.builtin.systemd:
+    name: chronyd
+    enabled: true
+    state: started
+
+- name: Убрать имена реплик с loopback в /etc/hosts
+  ansible.builtin.replace:
+    path: /etc/hosts
+    regexp: '^(?:127\.0\.0\.1|127\.0\.1\.1|::1)\s+.*\b{{ item | regex_escape }}\b.*$'
+    replace: '# freeipa-install: \g<0>'
+  loop: "{{ groups['ipa_servers'] }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Собрать строки адресов реплик
+  ansible.builtin.set_fact:
+    freeipa_hosts_lines: "{{ freeipa_hosts_lines | default([]) + [hostvars[item].freeipa_ip_address ~ ' ' ~ item ~ ' ' ~ (item.split('.')[0])] }}"
+  loop: "{{ groups['ipa_servers'] }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Прописать реплики в /etc/hosts до появления DNS
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE FREEIPA"
+    block: "{{ freeipa_hosts_lines | join('\n') }}"
+    mode: "0644"
+
+- name: Задать постоянный FQDN
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+    use: systemd
+
+- name: Проверить, что FQDN резолвится в адрес реплики, а не в loopback
+  ansible.builtin.shell: |
+    set -euo pipefail
+    ips="$(getent hosts {{ inventory_hostname }} | awk '{print $1}' || true)"
+    if printf '%s\n' "$ips" | grep -Eq '^(127\.|::1$)'; then
+      echo "{{ inventory_hostname }} резолвится в loopback. Уберите это имя со строк 127.0.0.1, 127.0.1.1 и ::1 в /etc/hosts." >&2
+      exit 1
+    fi
+    if ! printf '%s\n' "$ips" | grep -Fxq '{{ freeipa_ip_address }}'; then
+      echo "{{ inventory_hostname }} не резолвится в {{ freeipa_ip_address }}. getent вернул: ${ips:-пусто}" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Проверить свободное место
+  ansible.builtin.shell: |
+    set -euo pipefail
+    min={{ freeipa_install_min_free_mb }}
+    for path in / /var; do
+      avail="$(df -BM --output=avail "$path" | awk 'NR==2 { gsub(/M/, "", $1); print $1 }')"
+      avail="${avail:-0}"
+      echo "${path} ${avail}MB free"
+      if (( avail < min )); then
+        echo "На ${path} свободно ${avail} МиБ, для установки нужно минимум ${min} МиБ." >&2
+        exit 1
+      fi
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Узнать, установлен ли уже FreeIPA
+  ansible.builtin.stat:
+    path: /etc/ipa/default.conf
+  register: freeipa_installed_conf
+
+- name: Узнать, не остался ли каталог от оборванной установки
+  ansible.builtin.stat:
+    path: /etc/dirsrv
+  register: freeipa_dirsrv_root
+
+- name: Посчитать остатки инстансов dirsrv
+  ansible.builtin.shell: |
+    shopt -s nullglob
+    dirs=(/etc/dirsrv/slapd-*)
+    echo "${#dirs[@]}"
+  args:
+    executable: /bin/bash
+  register: freeipa_dirsrv_count
+  changed_when: false
+  when:
+    - freeipa_dirsrv_root.stat.isdir | default(false)
+    - not freeipa_installed_conf.stat.exists
+
+- name: Оборванную установку не продолжать поверх
+  ansible.builtin.assert:
+    that:
+      - (freeipa_dirsrv_count.stdout | int) == 0
+    fail_msg: >-
+      На хосте есть /etc/dirsrv, но нет /etc/ipa/default.conf.
+      Похоже, прошлая установка оборвалась. На этой машине выполните
+      ipa-server-install --uninstall -U и снова запустите install.yml.
+  when:
+    - not freeipa_installed_conf.stat.exists
+    - freeipa_dirsrv_root.stat.isdir | default(false)
+
+- name: Аргументы DNS и NTP без паролей
+  ansible.builtin.set_fact:
+    freeipa_install_dns_args: []
+
+- name: Передать DNS-forwarders установщику
+  ansible.builtin.set_fact:
+    freeipa_install_dns_args: "{{ freeipa_install_dns_args + ['--forwarder=' ~ item] }}"
+  loop: "{{ freeipa_dns_forwarders }}"
+  loop_control:
+    label: "{{ item }}"
+  when: freeipa_dns_forwarders | length > 0
+
+- name: Явно поставить IPA DNS без forwarders
+  ansible.builtin.set_fact:
+    freeipa_install_dns_args: "{{ freeipa_install_dns_args + ['--no-forwarders'] }}"
+  when: freeipa_dns_no_forwarders | bool
+
+- name: Создавать обратную зону
+  ansible.builtin.set_fact:
+    freeipa_install_dns_args: "{{ freeipa_install_dns_args + ['--auto-reverse'] }}"
+  when: freeipa_auto_reverse | bool
+
+- name: Выключить проверку DNSSEC, если так задано
+  ansible.builtin.set_fact:
+    freeipa_install_dns_args: "{{ freeipa_install_dns_args + ['--no-dnssec-validation'] }}"
+  when: freeipa_no_dnssec_validation | bool
+
+- name: Разрешить пересечение зон, если так задано
+  ansible.builtin.set_fact:
+    freeipa_install_dns_args: "{{ freeipa_install_dns_args + ['--allow-zone-overlap'] }}"
+  when: freeipa_allow_zone_overlap | bool
+
+- name: Передать NTP-серверы установщику
+  ansible.builtin.set_fact:
+    freeipa_install_dns_args: "{{ freeipa_install_dns_args + ['--ntp-server=' ~ item] }}"
+  loop: "{{ freeipa_ntp_servers }}"
+  loop_control:
+    label: "{{ item }}"
+  when: freeipa_ntp_servers | length > 0

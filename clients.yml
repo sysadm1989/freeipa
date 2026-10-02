@@ -1,0 +1,12 @@
+---
+# Список реплик в SSSD и кэш учёток, чтобы клиент переживал падение части IPA.
+# Запустите после правки inventory/group_vars/ipa_clients.yml.
+
+- name: Отказоустойчивость клиентов FreeIPA
+  hosts: ipa_clients
+  become: true
+  gather_facts: true
+  serial: 20
+  roles:
+    - role: freeipa_resilience
+      tasks_from: client

@@ -1,0 +1,29 @@
+---
+# Панель управления серверами. Остальные значения и пояснения —
+# в roles/freeipa_resilience/defaults/main.yml.
+#
+# freeipa_ntp_servers:
+#   - 192.0.2.1
+#   - 192.0.2.2
+#
+# Локальный ipa-backup по умолчанию выключен: он легко забивает /var,
+# а полный диск роняет dirsrv. Включайте только вместе с выносом копий с хоста.
+# freeipa_resilience_backup_enabled: false
+#
+# Поочерёдный ipactl restart (нужен, чтобы поднять лимит файловых дескрипторов).
+# Не включайте на первом прогоне. Play идёт с serial: 1.
+# freeipa_resilience_rolling_restart: true
+
+freeipa_ntp_servers: []
+freeipa_resilience_backup_enabled: false
+
+# Домен установки. example.test playbook отвергает. Realm по умолчанию — домен
+# в верхнем регистре. Свой realm задаётся так: freeipa_realm: EXAMPLE.COM
+freeipa_domain: example.test
+
+# Куда IPA DNS спрашивает имена, которых у неё нет. Пустой список останавливает
+# install.yml, пока не зададите forwarders или freeipa_dns_no_forwarders: true.
+freeipa_dns_forwarders: []
+# freeipa_dns_forwarders:
+#   - 192.0.2.1
+#   - 192.0.2.2

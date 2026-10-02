@@ -1,0 +1,25 @@
+---
+# Первая реплика, затем остальные по одной. После установки на каждом хосте
+# сразу включается укрепление из site.yml. Пароли только в inventory/secrets.yml.
+
+- name: Установить первую реплику FreeIPA
+  hosts: ipa_primary
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+  roles:
+    - role: freeipa_resilience
+      tasks_from: install_server
+    - role: freeipa_resilience
+
+- name: Установить остальные реплики FreeIPA
+  hosts: ipa_replicas
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+  roles:
+    - role: freeipa_resilience
+      tasks_from: install_replica
+    - role: freeipa_resilience

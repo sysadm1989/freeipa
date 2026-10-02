@@ -1,0 +1,51 @@
+---
+- name: Подготовка хоста к установке FreeIPA
+  ansible.builtin.import_tasks: install_common.yml
+
+- name: Установить первую реплику
+  when: not freeipa_installed_conf.stat.exists
+  block:
+    - name: ipa-server-install
+      ansible.builtin.command:
+        argv: "{{ _ipa_install_cmd + (['--mkhomedir'] if freeipa_mkhomedir | bool else []) + freeipa_install_dns_args }}"
+      vars:
+        _ipa_install_cmd:
+          - /usr/sbin/ipa-server-install
+          - --unattended
+          - "--realm={{ freeipa_realm }}"
+          - "--domain={{ freeipa_domain }}"
+          - "--hostname={{ inventory_hostname }}"
+          - "--ip-address={{ freeipa_ip_address }}"
+          - "--ds-password={{ freeipa_ds_password }}"
+          - "--admin-password={{ freeipa_admin_password }}"
+          - --setup-dns
+      no_log: "{{ not (freeipa_install_debug | bool) }}"
+      changed_when: true
+  rescue:
+    - name: Хвост журнала неудачной установки
+      ansible.builtin.command: tail -n 80 /var/log/ipaserver-install.log
+      register: freeipa_install_log
+      changed_when: false
+      failed_when: false
+    - name: Показать журнал установки
+      ansible.builtin.debug:
+        msg: "{{ freeipa_install_log.stdout_lines | default(['/var/log/ipaserver-install.log не найден']) | reject('search', '(?i)--(ds|admin)-password') | list }}"
+    - name: Остановить playbook после ошибки установки
+      ansible.builtin.fail:
+        msg: >-
+          ipa-server-install не выполнен. Журнал выше и
+          /var/log/ipaserver-install.log. Перед повтором на этой машине:
+          ipa-server-install --uninstall -U
+
+- name: FreeIPA уже был установлен
+  ansible.builtin.debug:
+    msg: "На {{ inventory_hostname }} FreeIPA уже есть, ipa-server-install пропущен."
+  when: freeipa_installed_conf.stat.exists
+
+- name: Дождаться служб первой реплики
+  ansible.builtin.command: /usr/sbin/ipactl status
+  register: freeipa_ipactl
+  changed_when: false
+  retries: 12
+  delay: 10
+  until: freeipa_ipactl.rc == 0 and 'STOPPED' not in freeipa_ipactl.stdout

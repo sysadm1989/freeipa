@@ -1,0 +1,63 @@
+Разбор состояния FreeIPA на этом хосте
+=======================================
+
+Сводка, с неё начинать:
+  cat /var/log/ipa/state/latest.txt
+
+Только машинный заголовок, до подробностей:
+  awk 'BEGIN{body=0} /^===== /{exit} {print}' /var/log/ipa/state/latest.txt
+
+Свежий снимок вручную:
+  /usr/local/sbin/ipa-resilience-state
+
+Healthcheck, полный JSON и короткие ошибки:
+  cat /var/log/ipa/healthcheck/latest.summary.txt
+  less /var/log/ipa/healthcheck/latest.json
+
+Повторный прогон:
+  systemctl start ipa-resilience-healthcheck.service
+  systemctl start ipa-resilience-state.service
+  systemctl --failed
+  systemctl list-timers 'ipa-resilience-*'
+
+Службы IPA:
+  ipactl status
+
+Если result=ATTENTION, поле attention_reasons подсказывает направление:
+
+  service:*          юнит не active. Смотреть journalctl -u <unit> -n 200
+  chrony             расхождение часов ломает Kerberos. chronyc tracking
+  low_memory         мало MemAvailable, рядом обычно OOM
+  dirsrv_fds         ns-slapd упёрся в лимит дескрипторов
+  disk:*             раздел заполнен. dirsrv на полном диске перестаёт писать
+  oom                ядро убивало процесс за последние 14 дней
+  replication        соглашение не в Error (0). Вторая реплика или сеть
+  single_server      реплика одна, отказа не переживёт
+  dirsrv_down        сокет LDAPI нет, каталог не запущен
+  certs              запрос certmonger не в MONITORING. getcert list
+  replication_query  ldapsearch к локальному dirsrv не выполнился
+
+Журнал ядра и дампы:
+  journalctl -k --since "14 days ago" -g 'oom|Out of memory'
+  coredumpctl list
+  coredumpctl info
+
+Ошибки каталога и httpd:
+  tail -n 200 /var/log/dirsrv/slapd-*/errors
+  tail -n 200 /var/log/httpd/error_log
+
+Пакет sos, если нужен архив для чужого разбора:
+  sos report -o ipa,dirsrv,krb5,httpd,logs
+
+Чего не делать в панике:
+  не запускать ipactl restart на всех репликах сразу
+  не делать re-initialize, пока не ясно, какая реплика новее
+  не восстанавливать бэкап поверх живой реплики
+  не удалять /var/lib/dirsrv, чтобы «починить место»
+
+Обслуживание одной реплики:
+  1. На всех репликах result=OK и replication_bad=0
+  2. Если эта реплика — CA renewal master, сначала перенести роль
+     ipa config-mod --ca-renewal-master-server=<другая-реплика>
+  3. Остановить только её: ipactl stop
+  4. После старта дождаться replication_bad=0, потом следующая

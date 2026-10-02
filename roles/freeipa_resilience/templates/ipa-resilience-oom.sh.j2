@@ -1,0 +1,33 @@
+#!/bin/bash
+# Сразу понижает шанс, что OOM killer выберет процесс IPA.
+# Drop-in systemd применит то же значение при следующем старте.
+set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+apply() {
+  local unit="$1" score="$2" pid current
+  if ! systemctl cat "$unit" >/dev/null 2>&1; then
+    return 0
+  fi
+  pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+  if [[ -z "${pid}" || "${pid}" == "0" || ! -w "/proc/${pid}/oom_score_adj" ]]; then
+    return 0
+  fi
+  current="$(cat "/proc/${pid}/oom_score_adj")"
+  if [[ "$current" == "$score" ]]; then
+    return 0
+  fi
+  echo "$score" >"/proc/${pid}/oom_score_adj"
+  echo "updated ${unit} pid=${pid} oom_score_adj ${current} -> ${score}"
+}
+
+{% for item in freeipa_resilience_units %}
+{% if '@' in item.unit %}
+while read -r unit _; do
+  [[ -z "${unit:-}" ]] && continue
+  apply "$unit" "{{ item.oom_score_adjust }}"
+done < <(systemctl list-units --all --type=service --no-legend '{{ item.unit | replace("@.service", "@*.service") }}' || true)
+{% else %}
+apply "{{ item.unit }}" "{{ item.oom_score_adjust }}"
+{% endif %}
+{% endfor %}

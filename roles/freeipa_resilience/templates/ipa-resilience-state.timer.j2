@@ -1,0 +1,13 @@
+[Unit]
+Description=Снимок состояния FreeIPA каждые 15 минут
+ConditionPathExists=/etc/ipa/default.conf
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+AccuracySec=30s
+Persistent=true
+Unit=ipa-resilience-state.service
+
+[Install]
+WantedBy=timers.target

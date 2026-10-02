@@ -1,0 +1,13 @@
+[Unit]
+Description=Снимок состояния FreeIPA
+ConditionPathExists=/etc/ipa/default.conf
+After=dirsrv.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ipa-resilience-state
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=180
+SyslogIdentifier=ipa-resilience-state

@@ -1,0 +1,12 @@
+---
+# Укрепление уже установленных реплик FreeIPA и сбор состояния.
+# Роль не ставит сервер и не перезапускает его, пока явно не попросят.
+# serial: 1 обязателен для rolling restart: реплики нельзя гасить пачкой.
+
+- name: Отказоустойчивость серверов FreeIPA
+  hosts: ipa_servers
+  become: true
+  gather_facts: true
+  serial: 1
+  roles:
+    - freeipa_resilience

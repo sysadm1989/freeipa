@@ -1,0 +1,166 @@
+---
+- name: Базовые пакеты
+  ansible.builtin.package:
+    name:
+      - chrony
+      - python3
+    state: present
+
+- name: Пакет systemd-coredump для разбора падений dirsrv
+  ansible.builtin.package:
+    name: systemd-coredump
+    state: present
+  when: freeipa_resilience_dirsrv_coredumps | bool
+
+- name: Выбрать пакет healthcheck
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if rpm -q freeipa-healthcheck >/dev/null 2>&1; then
+      echo freeipa-healthcheck
+      exit 0
+    fi
+    if rpm -q ipa-healthcheck >/dev/null 2>&1; then
+      echo ipa-healthcheck
+      exit 0
+    fi
+    if command -v dnf >/dev/null 2>&1; then
+      mgr=dnf
+    else
+      mgr=yum
+    fi
+    if "$mgr" -q info freeipa-healthcheck >/dev/null 2>&1; then
+      echo freeipa-healthcheck
+    else
+      echo ipa-healthcheck
+    fi
+  args:
+    executable: /bin/bash
+  register: ipa_healthcheck_pkg
+  changed_when: false
+
+- name: Установить healthcheck
+  ansible.builtin.package:
+    name: "{{ ipa_healthcheck_pkg.stdout }}"
+    state: present
+
+- name: Убедиться, что время не ведёт второй демон ntpd
+  ansible.builtin.command: systemctl is-active ntpd
+  register: ipa_ntpd_state
+  changed_when: false
+  failed_when: false
+
+- name: Остановить настройку, если рядом с chrony запущен ntpd
+  ansible.builtin.assert:
+    that:
+      - ipa_ntpd_state.stdout != "active"
+    fail_msg: >-
+      Активен ntpd. Для Kerberos нужен один источник времени.
+      Остановите ntpd вручную и оставьте chronyd, затем повторите прогон.
+
+- name: Включить chronyd
+  ansible.builtin.systemd:
+    name: chronyd
+    enabled: true
+    state: started
+
+- name: Проверить каталог /etc/chrony.d
+  ansible.builtin.stat:
+    path: /etc/chrony.d
+  register: ipa_chrony_d
+
+- name: Не затирать chrony.conf, если drop-in каталога нет
+  ansible.builtin.assert:
+    that:
+      - ipa_chrony_d.stat.exists
+    fail_msg: "Задайте NTP в /etc/chrony.conf вручную: в этой версии chrony нет /etc/chrony.d."
+  when: freeipa_ntp_servers | length > 0
+
+- name: Добавить NTP-серверы в chrony
+  ansible.builtin.template:
+    src: chrony-ipa-resilience.conf.j2
+    dest: /etc/chrony.d/ipa-resilience.conf
+    mode: "0644"
+  when: freeipa_ntp_servers | length > 0
+  notify: Перезапустить chronyd
+
+- name: Убрать NTP drop-in, если список серверов пуст
+  ansible.builtin.file:
+    path: /etc/chrony.d/ipa-resilience.conf
+    state: absent
+  when:
+    - freeipa_ntp_servers | length == 0
+    - ipa_chrony_d.stat.exists
+  notify: Перезапустить chronyd
+
+- name: Каталоги конфигурации
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /etc/systemd/journald.conf.d
+    - /etc/systemd/coredump.conf.d
+    - /etc/sysctl.d
+    - /usr/local/sbin
+    - /usr/local/share/doc/freeipa-resilience
+    - /var/log/ipa/healthcheck
+    - /var/log/ipa/state
+
+- name: Постоянный журнал с потолком по месту
+  ansible.builtin.template:
+    src: journald-ipa-resilience.conf.j2
+    dest: /etc/systemd/journald.conf.d/ipa-resilience.conf
+    mode: "0644"
+  notify: Перезапустить systemd-journald
+
+- name: Ограничить размер coredump
+  ansible.builtin.template:
+    src: coredump-ipa-resilience.conf.j2
+    dest: /etc/systemd/coredump.conf.d/ipa-resilience.conf
+    mode: "0644"
+  when: freeipa_resilience_dirsrv_coredumps | bool
+
+- name: Снизить swappiness
+  ansible.builtin.template:
+    src: sysctl-ipa-resilience.conf.j2
+    dest: /etc/sysctl.d/90-ipa-resilience.conf
+    mode: "0644"
+  register: ipa_sysctl_file
+
+- name: Применить sysctl
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/90-ipa-resilience.conf
+  when: ipa_sysctl_file.changed
+  changed_when: true
+
+- name: Каталоги drop-in для служб IPA
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item.unit }}.d"
+    state: directory
+    mode: "0755"
+  loop: "{{ freeipa_resilience_units }}"
+  loop_control:
+    label: "{{ item.unit }}"
+
+- name: Защитить службы IPA от OOM и короткого цикла падений
+  ansible.builtin.template:
+    src: systemd-override.conf.j2
+    dest: "/etc/systemd/system/{{ item.unit }}.d/ipa-resilience.conf"
+    mode: "0644"
+  loop: "{{ freeipa_resilience_units }}"
+  loop_control:
+    label: "{{ item.unit }}"
+  notify: Перечитать юниты systemd
+
+- name: Применить drop-in до живой настройки OOM
+  ansible.builtin.meta: flush_handlers
+
+- name: Установить немедленную коррекцию OOMScoreAdjust
+  ansible.builtin.template:
+    src: ipa-resilience-oom.sh.j2
+    dest: /usr/local/sbin/ipa-resilience-oom
+    mode: "0750"
+
+- name: Понизить oom_score_adj у уже запущенных процессов
+  ansible.builtin.command: /usr/local/sbin/ipa-resilience-oom
+  register: ipa_oom_apply
+  changed_when: ipa_oom_apply.stdout | length > 0

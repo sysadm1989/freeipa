@@ -1,0 +1,15 @@
+# Управляется Ansible-ролью freeipa_resilience. Файл будет перезаписан.
+[Unit]
+StartLimitIntervalSec={{ freeipa_resilience_start_limit_interval }}
+StartLimitBurst={{ freeipa_resilience_start_limit_burst }}
+
+[Service]
+OOMScoreAdjust={{ item.oom_score_adjust }}
+LimitNOFILE={{ freeipa_resilience_nofile }}
+{% if item.limit_core | default('', true) | length > 0 %}
+LimitCORE={{ item.limit_core }}
+{% endif %}
+{% if item.restart_on_failure %}
+Restart=on-failure
+RestartSec={{ freeipa_resilience_restart_sec }}
+{% endif %}

@@ -1,0 +1,14 @@
+[Unit]
+Description=FreeIPA healthcheck (JSON-отчёт для разбора)
+ConditionPathExists=/etc/ipa/default.conf
+After=dirsrv.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ipa-resilience-healthcheck
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=720
+SyslogIdentifier=ipa-resilience-healthcheck

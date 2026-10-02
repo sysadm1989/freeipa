@@ -1,0 +1,14 @@
+[Unit]
+Description=Ежедневный FreeIPA healthcheck и проверка после загрузки
+ConditionPathExists=/etc/ipa/default.conf
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*-*-* 06:20:00
+Persistent=true
+RandomizedDelaySec=3min
+AccuracySec=1min
+Unit=ipa-resilience-healthcheck.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,27 @@
+#!/bin/bash
+# Online-копия данных IPA на этом же хосте. Это не замена выносу бэкапа.
+set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+KEEP_DAYS="{{ freeipa_resilience_backup_keep_days }}"
+MIN_FREE_MB="{{ freeipa_resilience_backup_min_free_mb }}"
+
+exec 9>/run/ipa-resilience-backup.lock
+if ! flock -n 9; then
+  echo "Предыдущий ipa-backup ещё идёт" >&2
+  exit 1
+fi
+
+avail="$(df -BM --output=avail /var/lib/ipa 2>/dev/null | awk 'NR==2 { gsub(/M/, "", $1); print $1 }')"
+if [[ -z "${avail}" ]]; then
+  avail="$(df -BM --output=avail /var | awk 'NR==2 { gsub(/M/, "", $1); print $1 }')"
+fi
+avail="${avail:-0}"
+if (( avail < MIN_FREE_MB )); then
+  echo "Мало места для ipa-backup: свободно ${avail} МиБ, нужно ${MIN_FREE_MB} МиБ" >&2
+  exit 1
+fi
+
+ipa-backup --data --online
+find /var/lib/ipa/backup -mindepth 1 -maxdepth 1 -type d -name 'ipa-data-*' -mtime +"$KEEP_DAYS" -print -exec rm -rf {} +
+echo "ipa-backup завершён, локальные ipa-data-* старше ${KEEP_DAYS} дн. удалены"

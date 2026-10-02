@@ -1,0 +1,129 @@
+---
+# Роль рассчитана на уже установленный сервер FreeIPA (RHEL 8/9/10 и совместимые).
+# Она не вызывает ipa-server-install / ipa-replica-install и по умолчанию
+# не перезапускает dirsrv: динамические параметры применяются сразу,
+# лимит дескрипторов — при следующем штатном старте процесса.
+
+# Свободное место на /var, /var/log и /var/lib/dirsrv. Ниже порога playbook
+# останавливается: дописывать логи и changelog на полный диск нельзя.
+freeipa_resilience_min_free_mb: 2048
+
+# Разрешить прогон по inventory с именами *.example.test (только для синтаксиса).
+freeipa_resilience_allow_example_inventory: false
+
+# NTP. Пустой список — не менять конфигурацию chrony, только убедиться,
+# что chronyd запущен, а ntpd не активен.
+freeipa_ntp_servers: []
+
+# --- dirsrv: применяется без перезапуска ---
+# 0 в IPA значит «не рвать простаивающие соединения». При утечке коннектов
+# от SSSD/реплик таблица соединений кончается и каталог перестаёт отвечать.
+freeipa_resilience_idletimeout: "3600"
+# Миллисекунды. Чуть выше заводских 10000, чтобы короткая пауза диска
+# не обрывала репликацию.
+freeipa_resilience_ioblocktimeout: "20000"
+# Сколько хранить changelog. Реплика, пролежавшая дольше этого срока,
+# уже не догонит поток и потребует re-initialize.
+freeipa_resilience_changelog_max_age: "30d"
+
+# --- dirsrv: записывается сейчас, действует после следующего старта ---
+freeipa_resilience_maxdescriptors: "65535"
+freeipa_resilience_listen_backlog: "256"
+freeipa_resilience_nofile: 65535
+
+# Потолок логов dirsrv, только если сейчас безлимит (0 или атрибут пуст).
+# Уже заданный администратором предел не понижается и не повышается.
+freeipa_resilience_access_log_max_disk_mb: "2048"
+freeipa_resilience_error_log_max_disk_mb: "1024"
+freeipa_resilience_audit_log_max_disk_mb: "1024"
+
+# Защита от OOM killer и ограниченный автоперезапуск после падения процесса.
+# Burst маленький специально: цикл перезапусков при порче базы вреднее простоя.
+freeipa_resilience_start_limit_interval: 10min
+freeipa_resilience_start_limit_burst: 3
+freeipa_resilience_restart_sec: 15s
+
+freeipa_resilience_units:
+  - unit: dirsrv@.service
+    oom_score_adjust: -900
+    restart_on_failure: true
+    limit_core: "infinity"
+  - unit: krb5kdc.service
+    oom_score_adjust: -850
+    restart_on_failure: true
+  - unit: kadmin.service
+    oom_score_adjust: -850
+    restart_on_failure: true
+  - unit: httpd.service
+    oom_score_adjust: -700
+    restart_on_failure: true
+  - unit: pki-tomcatd@.service
+    oom_score_adjust: -750
+    restart_on_failure: true
+  - unit: named-pkcs11.service
+    oom_score_adjust: -650
+    restart_on_failure: true
+  - unit: certmonger.service
+    oom_score_adjust: -600
+    restart_on_failure: true
+  - unit: chronyd.service
+    oom_score_adjust: -500
+    restart_on_failure: true
+  - unit: oddjobd.service
+    oom_score_adjust: -400
+    restart_on_failure: true
+
+freeipa_resilience_dirsrv_coredumps: true
+freeipa_resilience_coredump_process_size_max: 2G
+freeipa_resilience_coredump_external_size_max: 2G
+freeipa_resilience_coredump_max_use: 4G
+
+freeipa_resilience_swappiness: 10
+
+freeipa_resilience_journal_max_use: 2G
+freeipa_resilience_journal_max_file_size: 128M
+freeipa_resilience_journal_retention: 1month
+
+# Наблюдаемость
+freeipa_resilience_healthcheck_timeout: 600
+freeipa_resilience_healthcheck_keep_days: 30
+freeipa_resilience_run_healthcheck_now: true
+
+freeipa_resilience_state_keep_days: 14
+freeipa_resilience_state_disk_used_pct_max: 85
+freeipa_resilience_state_fd_used_pct_max: 80
+# Ненулевой код выхода отчёта, если сводка не OK: юнит виден в systemctl --failed.
+freeipa_resilience_state_strict_exit: true
+freeipa_resilience_run_state_now: true
+
+# Локальный online-бэкап данных. Выключен по умолчанию.
+freeipa_resilience_backup_enabled: false
+freeipa_resilience_backup_keep_days: 14
+freeipa_resilience_backup_min_free_mb: 10240
+
+# ipactl restart по одной реплике. По умолчанию выключен.
+freeipa_resilience_rolling_restart: false
+freeipa_resilience_restart_settle_seconds: 90
+
+# Клиенты
+freeipa_client_ipa_servers: ""
+freeipa_client_cache_credentials: true
+freeipa_client_allow_example_domain: false
+
+# Первичная установка (install.yml). Паролей здесь нет: они в inventory/secrets.yml.
+freeipa_domain: ""
+freeipa_realm: ""
+freeipa_ds_password: ""
+freeipa_admin_password: ""
+freeipa_setup_dns: true
+freeipa_setup_ca_on_replicas: true
+freeipa_dns_forwarders: []
+freeipa_dns_no_forwarders: false
+freeipa_auto_reverse: true
+freeipa_no_dnssec_validation: false
+freeipa_allow_zone_overlap: false
+freeipa_mkhomedir: true
+# true показывает командную строку установщика, включая пароли.
+freeipa_install_debug: false
+freeipa_install_min_free_mb: 8192
+freeipa_install_min_mem_mb: 3500

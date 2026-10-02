@@ -1,0 +1,4 @@
+# Управляется Ansible-ролью freeipa_resilience.
+{% for server in freeipa_ntp_servers %}
+server {{ server }} iburst
+{% endfor %}

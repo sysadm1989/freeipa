@@ -1,0 +1,19 @@
+---
+- name: Перечитать юниты systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Перезапустить chronyd
+  ansible.builtin.systemd:
+    name: chronyd
+    state: restarted
+
+- name: Перезапустить systemd-journald
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted
+
+- name: Перезапустить sssd
+  ansible.builtin.systemd:
+    name: sssd
+    state: restarted

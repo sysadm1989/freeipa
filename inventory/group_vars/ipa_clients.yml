@@ -1,0 +1,5 @@
+---
+# DNS SRV, затем явные реплики: если DNS недоступен, SSSD идёт по списку.
+# Замените example.test до запуска — роль откажется применять пример.
+freeipa_client_ipa_servers: "_srv_, ipa1.example.test, ipa2.example.test, ipa3.example.test"
+freeipa_client_cache_credentials: true

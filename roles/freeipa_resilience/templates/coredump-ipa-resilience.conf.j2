@@ -1,0 +1,8 @@
+# Управляется Ansible-ролью freeipa_resilience.
+# Дамп ns-slapd нужен для разбора падения, но не должен забить /var.
+[Coredump]
+Storage=external
+Compress=yes
+ProcessSizeMax={{ freeipa_resilience_coredump_process_size_max }}
+ExternalSizeMax={{ freeipa_resilience_coredump_external_size_max }}
+MaxUse={{ freeipa_resilience_coredump_max_use }}

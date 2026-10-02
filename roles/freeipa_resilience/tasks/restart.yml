@@ -1,0 +1,28 @@
+---
+- name: Не перезапускать несколько реплик одним заходом
+  ansible.builtin.assert:
+    that:
+      - ansible_play_batch | length == 1
+    fail_msg: >-
+      rolling restart требует serial: 1 в play, иначе встанут все реплики сразу.
+      В site.yml это уже задано.
+  when: freeipa_resilience_rolling_restart | bool
+
+- name: Перезапустить FreeIPA на этой реплике
+  ansible.builtin.command: /usr/sbin/ipactl restart
+  when: freeipa_resilience_rolling_restart | bool
+  changed_when: true
+
+- name: Дождаться, пока службы IPA поднимутся
+  ansible.builtin.command: /usr/sbin/ipactl status
+  register: ipa_restart_status
+  until: ipa_restart_status.rc == 0 and 'STOPPED' not in ipa_restart_status.stdout
+  retries: 30
+  delay: 10
+  changed_when: false
+  when: freeipa_resilience_rolling_restart | bool
+
+- name: Дать репликации время догнать поток до следующей реплики
+  ansible.builtin.pause:
+    seconds: "{{ freeipa_resilience_restart_settle_seconds }}"
+  when: freeipa_resilience_rolling_restart | bool

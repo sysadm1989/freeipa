@@ -1,0 +1,4 @@
+inventory/hosts.yml
+inventory/secrets.yml
+*.retry
+.ansible/

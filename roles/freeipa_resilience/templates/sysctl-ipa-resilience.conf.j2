@@ -1,0 +1,4 @@
+# Управляется Ansible-ролью freeipa_resilience.
+# Небольшой swappiness: каталог не должен активно уходить в swap,
+# но совсем без подкачки OOM killer приходит раньше.
+vm.swappiness = {{ freeipa_resilience_swappiness }}

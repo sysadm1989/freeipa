@@ -1,0 +1,15 @@
+---
+- name: Установить настройку dirsrv
+  ansible.builtin.template:
+    src: ipa-dirsrv-tune.sh.j2
+    dest: /usr/local/sbin/ipa-dirsrv-tune
+    mode: "0750"
+
+- name: Применить параметры устойчивости dirsrv
+  ansible.builtin.command: /usr/local/sbin/ipa-dirsrv-tune
+  register: ipa_dirsrv_tune
+  changed_when: "'STATUS=changed' in ipa_dirsrv_tune.stdout"
+
+- name: Показать, что изменилось в dirsrv
+  ansible.builtin.debug:
+    var: ipa_dirsrv_tune.stdout_lines

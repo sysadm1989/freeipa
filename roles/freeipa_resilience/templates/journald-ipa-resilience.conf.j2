@@ -1,0 +1,10 @@
+# Управляется Ansible-ролью freeipa_resilience.
+# Журнал переживает перезагрузку, но не съедает диск.
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse={{ freeipa_resilience_journal_max_use }}
+SystemMaxFileSize={{ freeipa_resilience_journal_max_file_size }}
+MaxRetentionSec={{ freeipa_resilience_journal_retention }}
+RateLimitIntervalSec=30s
+RateLimitBurst=20000

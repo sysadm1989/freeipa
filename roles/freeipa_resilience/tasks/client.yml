@@ -1,0 +1,94 @@
+---
+- name: Список реплик для клиента задан
+  ansible.builtin.assert:
+    that:
+      - freeipa_client_ipa_servers | length > 0
+      - freeipa_client_allow_example_domain | bool or 'example.test' not in freeipa_client_ipa_servers
+    fail_msg: >-
+      Задайте freeipa_client_ipa_servers в inventory/group_vars/ipa_clients.yml.
+      Пример с example.test применяться не будет.
+
+- name: На клиенте есть конфигурация IPA
+  ansible.builtin.stat:
+    path: /etc/ipa/default.conf
+  register: ipa_client_conf
+
+- name: На клиенте есть sssd.conf
+  ansible.builtin.stat:
+    path: /etc/sssd/sssd.conf
+  register: ipa_sssd_conf
+
+- name: Клиент FreeIPA должен быть уже установлен
+  ansible.builtin.assert:
+    that:
+      - ipa_client_conf.stat.exists
+      - ipa_sssd_conf.stat.exists
+    fail_msg: Роль не ставит ipa-client. Нужны /etc/ipa/default.conf и /etc/sssd/sssd.conf.
+
+- name: Прочитать домен IPA
+  ansible.builtin.command:
+    argv:
+      - awk
+      - -F=
+      - '/^[[:space:]]*domain[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}'
+      - /etc/ipa/default.conf
+  register: ipa_domain_cmd
+  changed_when: false
+
+- name: Домен IPA не пустой
+  ansible.builtin.assert:
+    that:
+      - ipa_domain_cmd.stdout | trim | length > 0
+    fail_msg: В /etc/ipa/default.conf нет параметра domain.
+
+- name: Сохранить исходный sssd.conf один раз
+  ansible.builtin.copy:
+    src: /etc/sssd/sssd.conf
+    dest: /etc/sssd/sssd.conf.bak-ipa-resilience
+    remote_src: true
+    mode: "0600"
+    force: false
+
+- name: Прописать запасные реплики в SSSD
+  ansible.builtin.ini_file:
+    path: /etc/sssd/sssd.conf
+    section: "domain/{{ ipa_domain_cmd.stdout | trim | lower }}"
+    option: ipa_server
+    value: "{{ freeipa_client_ipa_servers }}"
+    mode: "0600"
+    owner: root
+    group: root
+  notify: Перезапустить sssd
+
+- name: Оставить кэш паролей, чтобы уже вошедшие пользователи пережили простой IPA
+  ansible.builtin.ini_file:
+    path: /etc/sssd/sssd.conf
+    section: "domain/{{ ipa_domain_cmd.stdout | trim | lower }}"
+    option: cache_credentials
+    value: "{{ 'True' if (freeipa_client_cache_credentials | bool) else 'False' }}"
+    mode: "0600"
+    owner: root
+    group: root
+  notify: Перезапустить sssd
+
+- name: Посмотреть, сколько DNS-серверов видит клиент
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if grep -Eq '^nameserver[[:space:]]+127\.0\.0\.53' /etc/resolv.conf; then
+      echo "systemd-resolved"
+      resolvectl dns 2>/dev/null || true
+    else
+      grep '^nameserver' /etc/resolv.conf || true
+    fi
+  args:
+    executable: /bin/bash
+  register: ipa_client_dns
+  changed_when: false
+
+- name: Показать DNS-резолверы клиента
+  ansible.builtin.debug:
+    msg: >-
+      Резолверы клиента: {{ ipa_client_dns.stdout_lines }}.
+      Нужны минимум два DNS с SRV-записями FreeIPA, иначе отказ единственного DNS
+      выглядит как отказ всех реплик. Исключение — один anycast-адрес, за которым
+      уже стоят несколько серверов.

@@ -1,0 +1,90 @@
+---
+- name: Скрипт снимка состояния
+  ansible.builtin.template:
+    src: ipa-resilience-state.sh.j2
+    dest: /usr/local/sbin/ipa-resilience-state
+    mode: "0750"
+
+- name: Скрипт healthcheck
+  ansible.builtin.template:
+    src: ipa-resilience-healthcheck.sh.j2
+    dest: /usr/local/sbin/ipa-resilience-healthcheck
+    mode: "0750"
+
+- name: Скрипт локального backup
+  ansible.builtin.template:
+    src: ipa-resilience-backup.sh.j2
+    dest: /usr/local/sbin/ipa-resilience-backup
+    mode: "0750"
+
+- name: Юниты наблюдения и backup
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - src: ipa-resilience-state.service.j2
+      dest: ipa-resilience-state.service
+    - src: ipa-resilience-state.timer.j2
+      dest: ipa-resilience-state.timer
+    - src: ipa-resilience-healthcheck.service.j2
+      dest: ipa-resilience-healthcheck.service
+    - src: ipa-resilience-healthcheck.timer.j2
+      dest: ipa-resilience-healthcheck.timer
+    - src: ipa-resilience-backup.service.j2
+      dest: ipa-resilience-backup.service
+    - src: ipa-resilience-backup.timer.j2
+      dest: ipa-resilience-backup.timer
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Памятка по разбору на самом сервере
+  ansible.builtin.template:
+    src: RUNBOOK.txt.j2
+    dest: /usr/local/share/doc/freeipa-resilience/RUNBOOK.txt
+    mode: "0644"
+
+- name: Включить снимок состояния каждые 15 минут
+  ansible.builtin.systemd:
+    name: ipa-resilience-state.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Включить ежедневный healthcheck
+  ansible.builtin.systemd:
+    name: ipa-resilience-healthcheck.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Управлять таймером локального backup
+  ansible.builtin.systemd:
+    name: ipa-resilience-backup.timer
+    enabled: "{{ freeipa_resilience_backup_enabled | bool }}"
+    state: "{{ 'started' if (freeipa_resilience_backup_enabled | bool) else 'stopped' }}"
+    daemon_reload: true
+
+- name: Снять состояние сразу
+  ansible.builtin.command: /usr/local/sbin/ipa-resilience-state
+  register: ipa_state_now
+  changed_when: false
+  failed_when: ipa_state_now.rc not in [0, 1]
+  when: freeipa_resilience_run_state_now | bool
+
+- name: Показать сводку состояния
+  ansible.builtin.debug:
+    msg: "{{ ipa_state_now.stdout_lines }}"
+  when: freeipa_resilience_run_state_now | bool
+
+- name: Запустить базовый healthcheck
+  ansible.builtin.command: /usr/local/sbin/ipa-resilience-healthcheck
+  register: ipa_healthcheck_now
+  changed_when: false
+  failed_when: ipa_healthcheck_now.rc not in [0, 1]
+  when: freeipa_resilience_run_healthcheck_now | bool
+
+- name: Показать сводку healthcheck
+  ansible.builtin.debug:
+    msg: "{{ ipa_healthcheck_now.stdout_lines }}"
+  when: freeipa_resilience_run_healthcheck_now | bool

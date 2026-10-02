@@ -1,0 +1,13 @@
+[Unit]
+Description=Локальный online-backup данных FreeIPA
+ConditionPathExists=/etc/ipa/default.conf
+After=dirsrv.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ipa-resilience-backup
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=6h
+SyslogIdentifier=ipa-resilience-backup

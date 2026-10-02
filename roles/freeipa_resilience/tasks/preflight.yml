@@ -1,0 +1,43 @@
+---
+- name: Отказать на учебном inventory
+  ansible.builtin.assert:
+    that:
+      - freeipa_resilience_allow_example_inventory | bool or not inventory_hostname.endswith('.example.test')
+    fail_msg: >-
+      Скопируйте inventory/hosts.yml.example в inventory/hosts.yml
+      и укажите реальные хосты. Имена *.example.test специально не подходят для прогона.
+
+- name: Проверить, что FreeIPA уже установлен
+  ansible.builtin.stat:
+    path: /etc/ipa/default.conf
+  register: ipa_default_conf
+
+- name: Роль рассчитана на установленный сервер со systemd
+  ansible.builtin.assert:
+    that:
+      - ipa_default_conf.stat.exists
+      - ansible_os_family == "RedHat"
+      - ansible_service_mgr == "systemd"
+    fail_msg: >-
+      Нужен уже установленный сервер FreeIPA на RHEL, Rocky, Alma или Fedora.
+      Роль не выполняет ipa-server-install и ipa-replica-install.
+
+- name: Проверить свободное место на разделах IPA
+  ansible.builtin.shell: |
+    set -euo pipefail
+    min={{ freeipa_resilience_min_free_mb }}
+    for path in /var /var/log /var/lib/dirsrv; do
+      if [[ ! -e "$path" ]]; then
+        continue
+      fi
+      avail="$(df -BM --output=avail "$path" | awk 'NR==2 { gsub(/M/, "", $1); print $1 }')"
+      avail="${avail:-0}"
+      echo "${path} ${avail}MB free"
+      if (( avail < min )); then
+        echo "На ${path} свободно ${avail} МиБ, нужно минимум ${min} МиБ. Полный диск роняет dirsrv." >&2
+        exit 1
+      fi
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false

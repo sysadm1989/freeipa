@@ -1,0 +1,404 @@
+#!/bin/bash
+# Снимок состояния FreeIPA для разбора «почему лежало» и «лежит ли сейчас».
+# Пишет /var/log/ipa/state/latest.txt. При проблемах выходит с кодом 1,
+# чтобы юнит был виден в systemctl --failed.
+set -uo pipefail
+export PATH="/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+KEEP_DAYS="{{ freeipa_resilience_state_keep_days }}"
+DISK_MAX="{{ freeipa_resilience_state_disk_used_pct_max }}"
+FD_MAX="{{ freeipa_resilience_state_fd_used_pct_max }}"
+{% if freeipa_resilience_state_strict_exit is sameas false or freeipa_resilience_state_strict_exit in [0, '0', 'false', 'False', 'no', 'No', 'off'] %}
+STRICT=0
+{% else %}
+STRICT=1
+{% endif %}
+MEM_MIN_MB=512
+
+outdir="/var/log/ipa/state"
+mkdir -p "$outdir"
+chmod 0750 "$outdir"
+
+exec 9>/run/ipa-resilience-state.lock
+if ! flock -n 9; then
+  echo "Предыдущий снимок ещё пишется, пропуск"
+  exit 0
+fi
+
+ts="$(date +%Y%m%d-%H%M%S)"
+report="$(mktemp "${outdir}/.state-${ts}.XXXXXX")"
+details="$(mktemp)"
+trap 'rm -f "${details:-}"; if [[ -n "${report:-}" && -f "$report" ]]; then rm -f "$report"; fi; true' EXIT
+
+attention=0
+reasons=()
+
+mark() {
+  attention=1
+  reasons+=("$1")
+}
+
+host="$(hostname -f 2>/dev/null || hostname)"
+now="$(date -Is)"
+domain="$(awk -F= '/^[[:space:]]*domain[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' /etc/ipa/default.conf 2>/dev/null || true)"
+
+section() {
+  printf '\n===== %s =====\n' "$1" >>"$details"
+}
+
+unit_state() {
+  local unit="$1" state
+  state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+  if [[ -z "$state" ]]; then
+    state="unknown"
+  fi
+  printf '%s' "$state"
+}
+
+unit_exists() {
+  systemctl cat "$1" >/dev/null 2>&1
+}
+
+# --- службы ---
+service_lines=""
+check_unit() {
+  local unit="$1" critical="$2" state
+  unit_exists "$unit" || return 0
+  state="$(unit_state "$unit")"
+  service_lines+="service.${unit}=${state}"$'\n'
+  if [[ "$critical" -eq 1 && "$state" != "active" ]]; then
+    mark "service:${unit}=${state}"
+  fi
+}
+
+while read -r unit _; do
+  [[ -z "${unit:-}" ]] && continue
+  [[ "$unit" == *@.service ]] && continue
+  check_unit "$unit" 1
+done < <(systemctl list-unit-files --type=service --no-legend 'dirsrv@*.service' 2>/dev/null || true)
+
+for unit in krb5kdc.service kadmin.service httpd.service certmonger.service chronyd.service; do
+  check_unit "$unit" 1
+done
+if unit_exists "pki-tomcatd@pki-tomcat.service"; then
+  check_unit "pki-tomcatd@pki-tomcat.service" 1
+fi
+if unit_exists "named-pkcs11.service"; then
+  enabled="$(systemctl is-enabled named-pkcs11.service 2>/dev/null || true)"
+  if [[ "$enabled" == "enabled" || "$(unit_state named-pkcs11.service)" == "active" ]]; then
+    check_unit "named-pkcs11.service" 1
+  fi
+fi
+for unit in oddjobd.service ipa-custodia.service ipa-otpd.service ipa-dnskeysyncd.service sssd.service; do
+  check_unit "$unit" 0
+done
+
+# --- время ---
+chrony="unknown"
+if command -v chronyc >/dev/null 2>&1; then
+  tracking="$(chronyc tracking 2>&1 || true)"
+  if printf '%s\n' "$tracking" | grep -qi 'Leap status.*Normal'; then
+    chrony="synchronized"
+  else
+    chrony="UNSYNCED"
+    mark "chrony"
+  fi
+else
+  mark "chrony_missing"
+fi
+
+# --- память и fd ---
+mem_avail_mb="$(awk '/MemAvailable:/ { printf "%d", $2/1024 }' /proc/meminfo 2>/dev/null || echo 0)"
+if [[ "${mem_avail_mb:-0}" -lt "$MEM_MIN_MB" ]]; then
+  mark "low_memory"
+fi
+
+fd_pct_max=0
+fd_report=""
+for pid in $(pidof ns-slapd 2>/dev/null || true); do
+  fds="$(ls -1 "/proc/${pid}/fd" 2>/dev/null | wc -l | awk '{print $1}')"
+  soft="$(awk '/Max open files/ { print $4 }' "/proc/${pid}/limits" 2>/dev/null || true)"
+  oom="$(cat "/proc/${pid}/oom_score_adj" 2>/dev/null || echo "?")"
+  pct=0
+  if [[ "${soft:-}" =~ ^[0-9]+$ && "$soft" -gt 0 && "${fds:-0}" =~ ^[0-9]+$ ]]; then
+    pct=$(( fds * 100 / soft ))
+    if (( pct > fd_pct_max )); then
+      fd_pct_max=$pct
+    fi
+  fi
+  fd_report+="ns-slapd pid=${pid} fds=${fds:-?} soft_limit=${soft:-?} used_pct=${pct} oom_score_adj=${oom}"$'\n'
+done
+if (( fd_pct_max >= FD_MAX )); then
+  mark "dirsrv_fds"
+fi
+
+# --- диск ---
+disk_lines=""
+for path in / /var /var/log /var/lib/dirsrv /var/log/dirsrv; do
+  [[ -e "$path" ]] || continue
+  read -r used target < <(df -P "$path" | awk 'NR==2 { gsub(/%/,"",$5); print $5, $6 }')
+  if [[ -z "${used:-}" || -z "${target:-}" ]]; then
+    continue
+  fi
+  disk_lines+="disk.${target}=${used}"$'\n'
+  if [[ "${used:-0}" =~ ^[0-9]+$ ]] && (( used >= DISK_MAX )); then
+    mark "disk:${target}=${used}%"
+  fi
+done
+
+# --- OOM за 14 дней ---
+oom_text="$(journalctl -k --since "14 days ago" --no-pager -n 80 -g 'Out of memory|oom-kill|Killed process' 2>/dev/null || true)"
+oom_count=0
+if [[ -n "$oom_text" ]]; then
+  oom_count="$(printf '%s\n' "$oom_text" | grep -ciE 'out of memory|oom-kill|killed process' || true)"
+fi
+if [[ "${oom_count:-0}" -gt 0 ]]; then
+  mark "oom"
+fi
+
+# --- репликация и CA через LDAPI, без Kerberos ---
+repl_table=""
+repl_total=0
+repl_bad=0
+repl_query="no-instance"
+ca_master=""
+shopt -s nullglob
+for dir in /etc/dirsrv/slapd-*; do
+  [[ -d "$dir" ]] || continue
+  inst="$(basename "$dir")"
+  inst="${inst#slapd-}"
+  sock=""
+  for candidate in "/run/slapd-${inst}.socket" "/var/run/slapd-${inst}.socket"; do
+    if [[ -S "$candidate" ]]; then
+      sock="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$sock" ]]; then
+    repl_query="dirsrv-down"
+    mark "dirsrv_down"
+    continue
+  fi
+  LDAPI="ldapi://${sock//\//%2F}"
+  ag_out="$(mktemp)"
+  ag_err="$(mktemp)"
+  if ldapsearch -LLL -o ldif-wrap=no -Y EXTERNAL -H "$LDAPI" \
+      -b "cn=mapping tree,cn=config" "(objectClass=nsds5ReplicationAgreement)" \
+      cn nsDS5ReplicaHost nsds5replicaLastUpdateStatus nsds5replicaUpdateInProgress nsds5replicaLastUpdateEnd \
+      >"$ag_out" 2>"$ag_err"; then
+    repl_query="ok"
+    parsed="$(awk 'BEGIN { RS=""; FS="\n" }
+      {
+        cn=""; host=""; status=""; progress=""; endt=""
+        for (i=1; i<=NF; i++) {
+          line=$i
+          low=tolower(line)
+          if (low ~ /^cn: /) cn=substr(line, index(line, ":")+2)
+          if (low ~ /^nsds5replicahost: /) host=substr(line, index(line, ":")+2)
+          if (low ~ /^nsds5replicalastupdatestatus: /) status=substr(line, index(line, ":")+2)
+          if (low ~ /^nsds5replicaupdateinprogress: /) progress=substr(line, index(line, ":")+2)
+          if (low ~ /^nsds5replicalastupdateend: /) endt=substr(line, index(line, ":")+2)
+        }
+        if (cn=="" && host=="" && status=="") next
+        verdict="UNKNOWN"
+        slow=tolower(status)
+        if (slow ~ /error[[:space:]]*\(0\)/ || slow ~ /incremental update succeeded/) verdict="OK"
+        else if (status != "") verdict="BAD"
+        printf "%s\t%s\t%s\tin_progress=%s\tend=%s\t%s\n", verdict, host, cn, progress, endt, status
+      }' "$ag_out")"
+    repl_table+="${parsed}"$'\n'
+    while IFS=$'\t' read -r verdict _; do
+      [[ -z "${verdict:-}" ]] && continue
+      repl_total=$((repl_total + 1))
+      if [[ "$verdict" == "BAD" || "$verdict" == "UNKNOWN" ]]; then
+        repl_bad=$((repl_bad + 1))
+      fi
+    done <<<"$parsed"
+
+    suffixes="$(ldapsearch -LLL -o ldif-wrap=no -Y EXTERNAL -H "$LDAPI" -b "" -s base namingContexts 2>/dev/null \
+      | awk 'tolower($1)=="namingcontexts:" { print substr($0, index($0, ":")+2) }')"
+    while IFS= read -r suffix; do
+      [[ -z "$suffix" ]] && continue
+      [[ "$suffix" == o=* ]] && continue
+      ca_out="$(ldapsearch -LLL -o ldif-wrap=no -Y EXTERNAL -H "$LDAPI" \
+        -b "cn=ca_renewal,cn=ipa,cn=etc,${suffix}" -s base ipaCaRenewalMaster ipaConfigString 2>/dev/null || true)"
+      if [[ -n "$ca_out" ]]; then
+        ca_master+="${ca_out}"$'\n'
+      fi
+    done <<<"$suffixes"
+  else
+    repl_query="ldap-failed"
+    mark "replication_query"
+    printf 'ldapsearch agreements failed\n' >>"$details"
+    cat "$ag_err" >>"$details" 2>/dev/null || true
+  fi
+  rm -f "$ag_out" "$ag_err"
+done
+
+if [[ "$repl_query" == "ok" && "$repl_bad" -gt 0 ]]; then
+  mark "replication"
+fi
+if [[ "$repl_query" == "ok" && "$repl_total" -eq 0 ]]; then
+  mark "single_server"
+fi
+if [[ "$repl_query" == "no-instance" ]]; then
+  mark "no_dirsrv_instance"
+fi
+
+# --- сертификаты ---
+certs="$(getcert list 2>&1 || true)"
+cert_bad="$(printf '%s\n' "$certs" | awk '
+  /status:/ { total++; if ($0 !~ /MONITORING/) bad++ }
+  END { print bad+0 }
+')"
+if [[ "${cert_bad:-0}" -gt 0 ]]; then
+  mark "certs"
+fi
+
+# --- healthcheck, если уже есть ---
+hc_summary=""
+if [[ -f /var/log/ipa/healthcheck/latest.summary.txt ]]; then
+  hc_summary="$(cat /var/log/ipa/healthcheck/latest.summary.txt)"
+fi
+
+failed_units="$(systemctl --failed --no-legend --no-pager 2>/dev/null || true)"
+
+{
+  echo "host=${host}"
+  echo "domain=${domain:-unknown}"
+  echo "time=${now}"
+  echo "chrony=${chrony}"
+  echo "mem_available_mb=${mem_avail_mb:-0}"
+  echo "dirsrv_fd_used_pct=${fd_pct_max}"
+  printf '%s' "$disk_lines"
+  echo "oom_kills_14d=${oom_count:-0}"
+  echo "replication_query=${repl_query}"
+  echo "replication_agreements=${repl_total}"
+  echo "replication_bad=${repl_bad}"
+  echo "cert_requests_not_monitoring=${cert_bad:-0}"
+  printf '%s' "$service_lines"
+  if [[ -n "$ca_master" ]]; then
+    printf '%s\n' "$ca_master" | awk '{ low=tolower($0); if (low ~ /carenewalmaster/ || low ~ /ipaconfigstring/) print }'
+  else
+    echo "ca_renewal_master=unknown"
+  fi
+  if [[ "$attention" -eq 0 ]]; then
+    echo "result=OK"
+  else
+    echo "result=ATTENTION"
+    echo "attention_reasons=$(IFS=,; echo "${reasons[*]}")"
+  fi
+} >"$report"
+
+{
+  section "ipactl"
+  if command -v ipactl >/dev/null 2>&1; then
+    ipactl status >>"$details" 2>&1 || true
+  else
+    echo "ipactl не найден" >>"$details"
+  fi
+
+  section "replication"
+  if [[ -n "$repl_table" ]]; then
+    printf '%s\n' "$repl_table" >>"$details"
+  else
+    echo "соглашений нет или запрос не выполнен (${repl_query})" >>"$details"
+  fi
+  if [[ "$repl_query" == "ok" && "$repl_total" -eq 0 ]]; then
+    echo "Это единственная реплика: её остановка роняет весь домен." >>"$details"
+  fi
+
+  section "ca renewal master"
+  if [[ -n "$ca_master" ]]; then
+    printf '%s\n' "$ca_master" >>"$details"
+  else
+    echo "Запись cn=ca_renewal не прочитана (нет CA или dirsrv недоступен)." >>"$details"
+  fi
+
+  section "dirsrv file descriptors"
+  if [[ -n "$fd_report" ]]; then
+    printf '%s' "$fd_report" >>"$details"
+  else
+    echo "процесс ns-slapd не найден" >>"$details"
+  fi
+
+  section "chrony"
+  printf '%s\n' "${tracking:-chronyc недоступен}" >>"$details"
+  chronyc sources -n >>"$details" 2>&1 || true
+  timedatectl status >>"$details" 2>&1 || true
+
+  section "memory"
+  free -h >>"$details" 2>&1 || true
+
+  section "failed units"
+  if [[ -n "$failed_units" ]]; then
+    printf '%s\n' "$failed_units" >>"$details"
+  else
+    echo "нет" >>"$details"
+  fi
+
+  section "oom kernel log"
+  if [[ -n "$oom_text" ]]; then
+    printf '%s\n' "$oom_text" >>"$details"
+  else
+    echo "за 14 дней записей OOM нет" >>"$details"
+  fi
+
+  section "certificates"
+  printf '%s\n' "$certs" >>"$details"
+
+  section "listeners"
+  ss -lntup 2>/dev/null | awk 'NR==1 || /:53 |:88 |:389 |:636 |:443 |:464 |:749 |:8080 |:8443 /' >>"$details" || true
+
+  section "dirsrv errors"
+  for errf in /var/log/dirsrv/slapd-*/errors; do
+    [[ -f "$errf" ]] || continue
+    echo "-- ${errf}" >>"$details"
+    tail -n 400 "$errf" | grep -E 'ERR|CRIT' | tail -n 30 >>"$details" || true
+  done
+
+  section "httpd errors"
+  if [[ -f /var/log/httpd/error_log ]]; then
+    tail -n 400 /var/log/httpd/error_log | grep -Ei 'error|crit|emerg' | tail -n 30 >>"$details" || true
+  fi
+
+  section "journal errors 12h"
+  journalctl -p err --since "12 hours ago" -n 80 --no-pager >>"$details" 2>&1 || true
+
+  section "healthcheck summary"
+  if [[ -n "$hc_summary" ]]; then
+    printf '%s\n' "$hc_summary" >>"$details"
+  else
+    echo "ещё нет /var/log/ipa/healthcheck/latest.summary.txt" >>"$details"
+  fi
+
+  section "backups"
+  if [[ -d /var/lib/ipa/backup ]]; then
+    find /var/lib/ipa/backup -mindepth 1 -maxdepth 1 -type d -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort | tail -n 10 >>"$details" || true
+  else
+    echo "каталога /var/lib/ipa/backup нет" >>"$details"
+  fi
+
+  section "coredumps"
+  if command -v coredumpctl >/dev/null 2>&1; then
+    coredumpctl list --no-pager 2>&1 | tail -n 20 >>"$details" || true
+  else
+    echo "coredumpctl не установлен" >>"$details"
+  fi
+} 
+
+cat "$details" >>"$report"
+chmod 0640 "$report"
+final="${outdir}/state-${ts}.txt"
+mv "$report" "$final"
+ln -sfn "$(basename "$final")" "${outdir}/latest.txt"
+find "$outdir" -name 'state-*.txt' -mtime +"$KEEP_DAYS" -delete
+
+# В журнал systemd попадает только сводка, детали лежат в файле.
+awk 'BEGIN{body=0} /^===== /{exit} {print}' "$final"
+echo "report=${final}"
+
+if [[ "$attention" -eq 1 && "$STRICT" -eq 1 ]]; then
+  exit 1
+fi
+exit 0

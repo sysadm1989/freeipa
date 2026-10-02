@@ -1,0 +1,20 @@
+---
+- name: Проверки до изменений
+  ansible.builtin.import_tasks: preflight.yml
+  tags: [always]
+
+- name: Защита процессов, времени и журналов
+  ansible.builtin.import_tasks: hardening.yml
+  tags: [hardening]
+
+- name: Параметры каталога
+  ansible.builtin.import_tasks: dirsrv.yml
+  tags: [dirsrv]
+
+- name: Наблюдаемость
+  ansible.builtin.import_tasks: observe.yml
+  tags: [observe]
+
+- name: Поочерёдный перезапуск, только по явной просьбе
+  ansible.builtin.import_tasks: restart.yml
+  tags: [restart]

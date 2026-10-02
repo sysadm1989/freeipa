@@ -1,0 +1,86 @@
+#!/bin/bash
+# Полный ipa-healthcheck в JSON плюс короткая сводка для разбора.
+# Код выхода совпадает с ipa-healthcheck: 1 означает найденные проблемы.
+set -euo pipefail
+export PATH="/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+TIMEOUT="{{ freeipa_resilience_healthcheck_timeout }}"
+KEEP_DAYS="{{ freeipa_resilience_healthcheck_keep_days }}"
+outdir="/var/log/ipa/healthcheck"
+
+exec 9>/run/ipa-resilience-healthcheck.lock
+if ! flock -n 9; then
+  echo "Предыдущий healthcheck ещё идёт, пропуск" >&2
+  exit 0
+fi
+
+if ! command -v ipa-healthcheck >/dev/null 2>&1; then
+  echo "Команда ipa-healthcheck не найдена" >&2
+  exit 1
+fi
+
+mkdir -p "$outdir"
+chmod 0750 "$outdir"
+ts="$(date +%Y%m%d-%H%M%S)"
+outfile="${outdir}/healthcheck-${ts}.json"
+summary="${outdir}/healthcheck-${ts}.summary.txt"
+rc=0
+
+set +e
+timeout "$TIMEOUT" ipa-healthcheck --output-type json --output-file "$outfile"
+rc=$?
+set -e
+
+python3 - "$outfile" >"$summary" <<'PY' || echo "summary_failed" >>"$summary"
+import json
+import os
+import sys
+from collections import Counter
+
+path = sys.argv[1]
+if not os.path.exists(path) or os.path.getsize(path) == 0:
+    print("healthcheck_report=missing")
+    sys.exit(0)
+
+with open(path, "r", encoding="utf-8", errors="replace") as handle:
+    data = json.load(handle)
+
+if isinstance(data, dict):
+    data = data.get("checks") or data.get("result") or []
+if not isinstance(data, list):
+    print("healthcheck_report=unparsed")
+    sys.exit(0)
+
+counts = Counter(item.get("result", "UNKNOWN") for item in data if isinstance(item, dict))
+print("healthcheck_file={0}".format(os.path.basename(path)))
+for key in sorted(counts):
+    print("result.{0}={1}".format(key, counts[key]))
+print("")
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    result = item.get("result", "")
+    if result == "SUCCESS":
+        continue
+    kw = item.get("kw") or {}
+    msg = kw.get("msg", "")
+    if not isinstance(msg, str):
+        msg = str(msg)
+    msg = " ".join(msg.split())[:400]
+    print("{0}\t{1}\t{2}\t{3}".format(
+        result,
+        item.get("source", ""),
+        item.get("check", ""),
+        msg,
+    ))
+PY
+
+chmod 0640 "$outfile" "$summary" 2>/dev/null || true
+ln -sfn "$(basename "$outfile")" "${outdir}/latest.json"
+ln -sfn "$(basename "$summary")" "${outdir}/latest.summary.txt"
+find "$outdir" -name 'healthcheck-*.json' -mtime +"$KEEP_DAYS" -delete
+find "$outdir" -name 'healthcheck-*.summary.txt' -mtime +"$KEEP_DAYS" -delete
+
+echo "healthcheck_rc=${rc}"
+cat "$summary"
+exit "$rc"
